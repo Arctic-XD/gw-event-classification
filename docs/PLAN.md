@@ -842,14 +842,657 @@ GW170817,1187008882.4,O2,H1L1V1,BNS,NS-present,1.46,1.27,1.186,<1e-7
 **Milestone:** M2  
 **Goal:** Extract interpretable features from spectrograms
 
-| Issue | Title | Description |
-|-------|-------|-------------|
-| E3-1 | Ridge extraction | Implement peak tracking for chirp ridge (ADR-018) |
-| E3-2 | Chirp geometry features | Ridge slope, duration, time-to-peak |
-| E3-3 | Frequency features | Peak freq, band power ratios, spectral centroid |
-| E3-4 | Statistical features | Spectral entropy, kurtosis, skewness |
-| E3-5 | Feature dataset | Generate features CSV for all events |
-| E3-6 | Feature exploration | Notebook with distributions, correlations, class separation |
+---
+
+### E3-1: Ridge Extraction
+**Priority:** 🔴 Critical | **Estimate:** 4-5 hours
+
+**Objective:** Implement chirp ridge tracking via peak detection (ADR-018)
+
+**Implementation Steps:**
+1. Update `src/features/ridge.py`:
+   ```python
+   import numpy as np
+   from scipy.ndimage import maximum_filter, gaussian_filter1d
+   from scipy.stats import linregress
+   from dataclasses import dataclass
+   from typing import Tuple, Optional
+   
+   @dataclass
+   class RidgeResult:
+       """Container for ridge extraction results"""
+       times: np.ndarray           # Time bins where ridge detected
+       frequencies: np.ndarray     # Peak frequency at each time
+       powers: np.ndarray          # Power at each ridge point
+       slope: float                # Linear fit slope (Hz/s)
+       intercept: float            # Linear fit intercept
+       r_squared: float            # Goodness of fit
+       duration: float             # Ridge duration in seconds
+       
+   class ChirpRidgeExtractor:
+       def __init__(self, config):
+           self.power_threshold = config.get('ridge_power_threshold', 0.3)
+           self.min_ridge_points = config.get('min_ridge_points', 10)
+           self.smooth_sigma = config.get('ridge_smooth_sigma', 2)
+           
+       def extract(self, specgram: np.ndarray, times: np.ndarray, 
+                   frequencies: np.ndarray) -> Optional[RidgeResult]:
+           """
+           Extract chirp ridge using per-time-bin peak tracking
+           
+           Algorithm:
+           1. For each time bin, find frequency with maximum power
+           2. Apply power threshold to filter noise
+           3. Smooth the ridge trajectory
+           4. Fit linear regression for slope estimation
+           """
+           n_times, n_freqs = specgram.shape
+           
+           # Step 1: Find peak frequency at each time bin
+           peak_indices = np.argmax(specgram, axis=1)
+           peak_frequencies = frequencies[peak_indices]
+           peak_powers = specgram[np.arange(n_times), peak_indices]
+           
+           # Step 2: Normalize powers and apply threshold
+           norm_powers = (peak_powers - peak_powers.min()) / (peak_powers.max() - peak_powers.min() + 1e-10)
+           valid_mask = norm_powers > self.power_threshold
+           
+           # Need minimum number of valid points
+           if valid_mask.sum() < self.min_ridge_points:
+               return None
+           
+           # Step 3: Extract valid ridge points
+           valid_times = times[valid_mask]
+           valid_freqs = peak_frequencies[valid_mask]
+           valid_powers = peak_powers[valid_mask]
+           
+           # Step 4: Smooth the ridge (reduce noise)
+           if len(valid_freqs) > self.smooth_sigma * 2:
+               smoothed_freqs = gaussian_filter1d(valid_freqs, self.smooth_sigma)
+           else:
+               smoothed_freqs = valid_freqs
+           
+           # Step 5: Linear regression for slope
+           slope, intercept, r_value, _, _ = linregress(valid_times, smoothed_freqs)
+           
+           return RidgeResult(
+               times=valid_times,
+               frequencies=smoothed_freqs,
+               powers=valid_powers,
+               slope=slope,
+               intercept=intercept,
+               r_squared=r_value**2,
+               duration=valid_times[-1] - valid_times[0]
+           )
+       
+       def extract_multi_ridge(self, specgram: np.ndarray, times: np.ndarray,
+                               frequencies: np.ndarray, n_ridges: int = 3) -> list:
+           """Extract multiple ridges (for complex signals)"""
+           ridges = []
+           remaining_specgram = specgram.copy()
+           
+           for _ in range(n_ridges):
+               ridge = self.extract(remaining_specgram, times, frequencies)
+               if ridge is None:
+                   break
+               ridges.append(ridge)
+               
+               # Mask out detected ridge for next iteration
+               for t_idx, f in zip(range(len(ridge.times)), ridge.frequencies):
+                   f_idx = np.argmin(np.abs(frequencies - f))
+                   # Zero out neighborhood
+                   remaining_specgram[t_idx, max(0,f_idx-5):min(len(frequencies),f_idx+5)] = 0
+           
+           return ridges
+   ```
+
+2. Test on GW150914:
+   ```python
+   # Load spectrogram
+   specgram = np.load('data/spectrograms/matrices/GW150914.npy')
+   
+   # Extract ridge
+   extractor = ChirpRidgeExtractor(CONFIG)
+   ridge = extractor.extract(specgram, times, frequencies)
+   
+   print(f"Ridge slope: {ridge.slope:.2f} Hz/s")
+   print(f"Duration: {ridge.duration:.3f} s")
+   print(f"R²: {ridge.r_squared:.3f}")
+   ```
+
+3. Visualize ridge overlay:
+   ```python
+   plt.figure(figsize=(10, 6))
+   plt.pcolormesh(times, frequencies, specgram.T, shading='auto')
+   plt.plot(ridge.times, ridge.frequencies, 'r-', linewidth=2, label='Detected ridge')
+   plt.xlabel('Time (s)')
+   plt.ylabel('Frequency (Hz)')
+   plt.colorbar(label='Power')
+   plt.legend()
+   plt.savefig('outputs/figures/ridge_detection_example.png')
+   ```
+
+**Acceptance Criteria:**
+- [ ] Ridge detected on >90% of events
+- [ ] Slope sign correct (positive for chirp)
+- [ ] R² > 0.7 for clean events
+- [ ] Visual validation on BBH and BNS examples
+
+**Files Modified:**
+- `src/features/ridge.py`
+
+---
+
+### E3-2: Chirp Geometry Features
+**Priority:** 🔴 Critical | **Estimate:** 3-4 hours
+
+**Objective:** Extract features describing chirp shape and evolution
+
+**Implementation Steps:**
+1. Add to `src/features/extractor.py`:
+   ```python
+   from src.features.ridge import ChirpRidgeExtractor, RidgeResult
+   import numpy as np
+   from scipy.stats import linregress
+   
+   class ChirpGeometryExtractor:
+       """Extract features from chirp ridge geometry"""
+       
+       def __init__(self, config):
+           self.ridge_extractor = ChirpRidgeExtractor(config)
+       
+       def extract(self, specgram: np.ndarray, times: np.ndarray,
+                   frequencies: np.ndarray, gps_merger: float) -> dict:
+           """Extract chirp geometry features"""
+           
+           ridge = self.ridge_extractor.extract(specgram, times, frequencies)
+           
+           if ridge is None:
+               return self._null_features()
+           
+           features = {}
+           
+           # 1. Ridge slope (Hz/s) - key discriminator
+           # BBH: steeper slope (faster chirp), BNS: gentler slope
+           features['ridge_slope'] = ridge.slope
+           features['ridge_slope_abs'] = abs(ridge.slope)
+           
+           # 2. Ridge curvature (deviation from linear)
+           # Fit quadratic and measure curvature
+           if len(ridge.times) > 5:
+               coeffs = np.polyfit(ridge.times, ridge.frequencies, 2)
+               features['ridge_curvature'] = coeffs[0]  # Quadratic coefficient
+           else:
+               features['ridge_curvature'] = 0.0
+           
+           # 3. Chirp duration (seconds)
+           features['chirp_duration'] = ridge.duration
+           
+           # 4. Frequency range spanned
+           features['freq_start'] = ridge.frequencies[0]
+           features['freq_end'] = ridge.frequencies[-1]
+           features['freq_range'] = ridge.frequencies[-1] - ridge.frequencies[0]
+           
+           # 5. Time to peak frequency (relative to merger)
+           peak_idx = np.argmax(ridge.frequencies)
+           features['time_to_peak'] = ridge.times[peak_idx] - gps_merger
+           
+           # 6. Peak frequency
+           features['peak_frequency'] = ridge.frequencies.max()
+           
+           # 7. Goodness of fit (R²)
+           features['ridge_r_squared'] = ridge.r_squared
+           
+           # 8. Ridge power statistics
+           features['ridge_power_mean'] = ridge.powers.mean()
+           features['ridge_power_max'] = ridge.powers.max()
+           features['ridge_power_std'] = ridge.powers.std()
+           
+           # 9. Frequency acceleration (second derivative proxy)
+           if len(ridge.frequencies) > 10:
+               freq_diff = np.diff(ridge.frequencies)
+               freq_accel = np.diff(freq_diff)
+               features['freq_acceleration_mean'] = freq_accel.mean()
+               features['freq_acceleration_max'] = freq_accel.max()
+           else:
+               features['freq_acceleration_mean'] = 0.0
+               features['freq_acceleration_max'] = 0.0
+           
+           # 10. Chirp mass proxy (from f_peak and slope)
+           # f ∝ M_c^(-5/8), so M_c ∝ f^(-8/5)
+           # This is a rough estimate, not calibrated
+           if features['peak_frequency'] > 0:
+               features['chirp_mass_proxy'] = (features['peak_frequency'] / 100) ** (-8/5) * 30
+           else:
+               features['chirp_mass_proxy'] = 0.0
+           
+           return features
+       
+       def _null_features(self) -> dict:
+           """Return null features when ridge not detected"""
+           return {
+               'ridge_slope': 0.0,
+               'ridge_slope_abs': 0.0,
+               'ridge_curvature': 0.0,
+               'chirp_duration': 0.0,
+               'freq_start': 0.0,
+               'freq_end': 0.0,
+               'freq_range': 0.0,
+               'time_to_peak': 0.0,
+               'peak_frequency': 0.0,
+               'ridge_r_squared': 0.0,
+               'ridge_power_mean': 0.0,
+               'ridge_power_max': 0.0,
+               'ridge_power_std': 0.0,
+               'freq_acceleration_mean': 0.0,
+               'freq_acceleration_max': 0.0,
+               'chirp_mass_proxy': 0.0,
+           }
+   ```
+
+2. Expected feature differences:
+
+   | Feature | BBH (typical) | BNS (typical) |
+   |---------|---------------|---------------|
+   | ridge_slope | 500-2000 Hz/s | 100-500 Hz/s |
+   | chirp_duration | 0.1-0.5 s | 1-10 s |
+   | peak_frequency | 100-300 Hz | 500-1500 Hz |
+   | freq_range | 50-200 Hz | 200-1000 Hz |
+
+**Acceptance Criteria:**
+- [ ] 16 geometry features extracted per event
+- [ ] Features show expected BBH vs BNS differences
+- [ ] No NaN/Inf values in output
+- [ ] Feature extraction < 0.5s per event
+
+**Files Modified:**
+- `src/features/extractor.py`
+
+---
+
+### E3-3: Frequency Features
+**Priority:** 🔴 Critical | **Estimate:** 3-4 hours
+
+**Objective:** Extract frequency-domain features from spectrograms
+
+**Implementation Steps:**
+1. Add `FrequencyFeatureExtractor` class:
+   ```python
+   class FrequencyFeatureExtractor:
+       """Extract frequency-domain features from spectrograms"""
+       
+       def __init__(self, config):
+           # Define frequency bands for analysis
+           self.bands = {
+               'low': (20, 80),      # Low-freq: heavy BBH
+               'mid': (80, 200),     # Mid-freq: light BBH, heavy NSBH
+               'high': (200, 500),   # High-freq: BNS, light NSBH
+               'very_high': (500, 1000)  # Very high: BNS inspiral
+           }
+       
+       def extract(self, specgram: np.ndarray, frequencies: np.ndarray) -> dict:
+           """Extract frequency features"""
+           features = {}
+           
+           # 1. Band power ratios
+           total_power = specgram.sum()
+           for band_name, (f_low, f_high) in self.bands.items():
+               mask = (frequencies >= f_low) & (frequencies < f_high)
+               band_power = specgram[:, mask].sum()
+               features[f'power_{band_name}'] = band_power / (total_power + 1e-10)
+           
+           # 2. Band power ratios (discriminative)
+           features['power_ratio_low_high'] = (
+               features['power_low'] / (features['power_high'] + 1e-10)
+           )
+           features['power_ratio_mid_high'] = (
+               features['power_mid'] / (features['power_high'] + 1e-10)
+           )
+           
+           # 3. Spectral centroid (center of mass)
+           power_per_freq = specgram.sum(axis=0)
+           features['spectral_centroid'] = np.average(frequencies, weights=power_per_freq + 1e-10)
+           
+           # 4. Spectral bandwidth (spread around centroid)
+           centroid = features['spectral_centroid']
+           features['spectral_bandwidth'] = np.sqrt(
+               np.average((frequencies - centroid)**2, weights=power_per_freq + 1e-10)
+           )
+           
+           # 5. Spectral rolloff (frequency below which 85% power)
+           cumsum = np.cumsum(power_per_freq)
+           rolloff_idx = np.searchsorted(cumsum, 0.85 * cumsum[-1])
+           features['spectral_rolloff'] = frequencies[min(rolloff_idx, len(frequencies)-1)]
+           
+           # 6. Spectral flatness (tonal vs noise-like)
+           geometric_mean = np.exp(np.mean(np.log(power_per_freq + 1e-10)))
+           arithmetic_mean = np.mean(power_per_freq)
+           features['spectral_flatness'] = geometric_mean / (arithmetic_mean + 1e-10)
+           
+           # 7. Peak frequency (global maximum)
+           max_power_freq_idx = np.argmax(power_per_freq)
+           features['peak_frequency_global'] = frequencies[max_power_freq_idx]
+           
+           # 8. Frequency at max power (time-resolved)
+           time_of_max = np.unravel_index(specgram.argmax(), specgram.shape)[0]
+           freq_of_max = np.argmax(specgram[time_of_max, :])
+           features['freq_at_max_power'] = frequencies[freq_of_max]
+           
+           # 9. Number of significant peaks
+           from scipy.signal import find_peaks
+           peaks, _ = find_peaks(power_per_freq, height=power_per_freq.max() * 0.1)
+           features['n_spectral_peaks'] = len(peaks)
+           
+           return features
+   ```
+
+2. Expected discriminative power:
+   - `power_ratio_low_high`: BBH >> BNS (BBH has more low-freq power)
+   - `spectral_centroid`: BBH < BNS (BBH centered at lower freq)
+   - `spectral_rolloff`: BBH < BNS
+
+**Acceptance Criteria:**
+- [ ] 12+ frequency features extracted
+- [ ] Band power ratios discriminate BBH vs BNS
+- [ ] Spectral centroid shows expected pattern
+- [ ] No division by zero errors
+
+**Files Modified:**
+- `src/features/extractor.py`
+
+---
+
+### E3-4: Statistical Features
+**Priority:** 🟠 High | **Estimate:** 2-3 hours
+
+**Objective:** Extract statistical/texture features from spectrograms
+
+**Implementation Steps:**
+1. Add `StatisticalFeatureExtractor` class:
+   ```python
+   from scipy.stats import kurtosis, skew, entropy
+   
+   class StatisticalFeatureExtractor:
+       """Extract statistical features from spectrograms"""
+       
+       def extract(self, specgram: np.ndarray) -> dict:
+           """Extract statistical features"""
+           features = {}
+           
+           # Flatten for global statistics
+           flat = specgram.flatten()
+           
+           # 1. Basic statistics
+           features['power_mean'] = np.mean(flat)
+           features['power_std'] = np.std(flat)
+           features['power_max'] = np.max(flat)
+           features['power_min'] = np.min(flat)
+           features['power_range'] = features['power_max'] - features['power_min']
+           
+           # 2. Higher-order moments
+           features['power_skewness'] = skew(flat)
+           features['power_kurtosis'] = kurtosis(flat)
+           
+           # 3. Spectral entropy (information content)
+           # Normalize to probability distribution
+           prob = flat / (flat.sum() + 1e-10)
+           features['spectral_entropy'] = entropy(prob + 1e-10)
+           
+           # 4. Temporal statistics (variation over time)
+           power_per_time = specgram.sum(axis=1)
+           features['temporal_std'] = np.std(power_per_time)
+           features['temporal_max_idx'] = np.argmax(power_per_time) / len(power_per_time)
+           
+           # 5. Contrast (local variation)
+           # Use gradient magnitude as proxy
+           grad_t = np.gradient(specgram, axis=0)
+           grad_f = np.gradient(specgram, axis=1)
+           gradient_mag = np.sqrt(grad_t**2 + grad_f**2)
+           features['contrast'] = np.mean(gradient_mag)
+           
+           # 6. Homogeneity proxy (inverse of contrast)
+           features['homogeneity'] = 1.0 / (features['contrast'] + 1e-10)
+           
+           # 7. Energy concentration
+           # Fraction of power in top 10% of bins
+           threshold = np.percentile(flat, 90)
+           features['energy_concentration'] = flat[flat > threshold].sum() / (flat.sum() + 1e-10)
+           
+           # 8. Signal-to-noise proxy
+           # Ratio of peak to median
+           features['snr_proxy'] = features['power_max'] / (np.median(flat) + 1e-10)
+           
+           return features
+   ```
+
+**Acceptance Criteria:**
+- [ ] 14+ statistical features extracted
+- [ ] Entropy meaningful (higher for noise-like)
+- [ ] SNR proxy correlates with catalog SNR
+- [ ] No numerical instabilities
+
+**Files Modified:**
+- `src/features/extractor.py`
+
+---
+
+### E3-5: Feature Dataset Generation
+**Priority:** 🔴 Critical | **Estimate:** 2-3 hours
+
+**Objective:** Generate complete feature CSV for all events
+
+**Implementation Steps:**
+1. Create `scripts/extract_features.py`:
+   ```python
+   #!/usr/bin/env python
+   """Extract features from all spectrograms"""
+   
+   import argparse
+   import pandas as pd
+   import numpy as np
+   from tqdm import tqdm
+   from pathlib import Path
+   
+   from src.features.extractor import (
+       ChirpGeometryExtractor,
+       FrequencyFeatureExtractor, 
+       StatisticalFeatureExtractor
+   )
+   from src.utils.config import load_config
+   
+   def main(args):
+       config = load_config(args.config)
+       
+       # Initialize extractors
+       geometry_ext = ChirpGeometryExtractor(config)
+       frequency_ext = FrequencyFeatureExtractor(config)
+       statistical_ext = StatisticalFeatureExtractor()
+       
+       # Load manifest
+       manifest = pd.read_csv(args.manifest)
+       
+       all_features = []
+       
+       for _, row in tqdm(manifest.iterrows(), total=len(manifest)):
+           event_name = row['event_name']
+           gps_time = row['gps_time']
+           
+           try:
+               # Load spectrogram
+               matrix_path = Path(config['paths']['spectrograms']) / 'matrices' / f"{event_name}.npy"
+               specgram = np.load(matrix_path)
+               
+               # Load metadata for times/frequencies
+               # (assuming saved during spectrogram generation)
+               meta_path = matrix_path.with_suffix('.json')
+               with open(meta_path) as f:
+                   meta = json.load(f)
+               times = np.array(meta['times'])
+               frequencies = np.array(meta['frequencies'])
+               
+               # Extract all features
+               geom_features = geometry_ext.extract(specgram, times, frequencies, gps_time)
+               freq_features = frequency_ext.extract(specgram, frequencies)
+               stat_features = statistical_ext.extract(specgram)
+               
+               # Combine
+               features = {
+                   'event_name': event_name,
+                   'label': row['label_binary'],
+                   'run': row['run'],
+                   **geom_features,
+                   **freq_features,
+                   **stat_features
+               }
+               
+               all_features.append(features)
+               
+           except Exception as e:
+               print(f"Failed {event_name}: {e}")
+               continue
+       
+       # Create DataFrame and save
+       df = pd.DataFrame(all_features)
+       df.to_csv(args.output, index=False)
+       
+       print(f"\nFeature extraction complete!")
+       print(f"Events: {len(df)}")
+       print(f"Features: {len(df.columns) - 3}")  # Exclude name, label, run
+       print(f"Output: {args.output}")
+   
+   if __name__ == '__main__':
+       parser = argparse.ArgumentParser()
+       parser.add_argument('--config', default='configs/config.yaml')
+       parser.add_argument('--manifest', default='manifests/event_manifest.csv')
+       parser.add_argument('--output', default='data/features/features.csv')
+       args = parser.parse_args()
+       main(args)
+   ```
+
+2. Run extraction:
+   ```bash
+   python scripts/extract_features.py
+   ```
+
+3. Verify output:
+   ```python
+   df = pd.read_csv('data/features/features.csv')
+   print(df.shape)  # (90, ~45)
+   print(df.describe())
+   print(df.isnull().sum())  # Check for missing values
+   ```
+
+**Expected Output:**
+```
+event_name,label,run,ridge_slope,chirp_duration,peak_frequency,...
+GW150914,BBH,O1,1234.5,0.23,156.7,...
+GW170817,NS-present,O2,345.6,2.1,892.3,...
+```
+
+**Acceptance Criteria:**
+- [ ] ~40+ features per event
+- [ ] No missing values
+- [ ] Labels correctly assigned
+- [ ] CSV readable by pandas
+
+**Files Created:**
+- `scripts/extract_features.py`
+- `data/features/features.csv`
+
+---
+
+### E3-6: Feature Exploration Notebook
+**Priority:** 🟠 High | **Estimate:** 3-4 hours
+
+**Objective:** Analyze feature distributions and class separability
+
+**Implementation Steps:**
+1. Create `notebooks/05_feature_extraction.ipynb`:
+   ```python
+   # Cell 1: Load features
+   import pandas as pd
+   import numpy as np
+   import matplotlib.pyplot as plt
+   import seaborn as sns
+   
+   df = pd.read_csv('../data/features/features.csv')
+   feature_cols = [c for c in df.columns if c not in ['event_name', 'label', 'run']]
+   
+   print(f"Events: {len(df)}")
+   print(f"BBH: {(df['label']=='BBH').sum()}")
+   print(f"NS-present: {(df['label']=='NS-present').sum()}")
+   
+   # Cell 2: Feature distributions by class
+   fig, axes = plt.subplots(4, 4, figsize=(16, 16))
+   for ax, col in zip(axes.flat, feature_cols[:16]):
+       for label in ['BBH', 'NS-present']:
+           data = df[df['label']==label][col]
+           ax.hist(data, alpha=0.5, label=label, bins=20)
+       ax.set_title(col)
+       ax.legend()
+   plt.tight_layout()
+   plt.savefig('../outputs/figures/feature_distributions.png')
+   
+   # Cell 3: Correlation matrix
+   corr = df[feature_cols].corr()
+   plt.figure(figsize=(14, 12))
+   sns.heatmap(corr, cmap='coolwarm', center=0, annot=False)
+   plt.title('Feature Correlation Matrix')
+   plt.savefig('../outputs/figures/feature_correlations.png')
+   
+   # Cell 4: Class separability analysis
+   from sklearn.feature_selection import mutual_info_classif
+   
+   X = df[feature_cols].values
+   y = (df['label'] == 'NS-present').astype(int).values
+   
+   mi_scores = mutual_info_classif(X, y, random_state=42)
+   mi_df = pd.DataFrame({'feature': feature_cols, 'MI': mi_scores})
+   mi_df = mi_df.sort_values('MI', ascending=False)
+   
+   plt.figure(figsize=(10, 8))
+   plt.barh(mi_df['feature'][:20], mi_df['MI'][:20])
+   plt.xlabel('Mutual Information')
+   plt.title('Top 20 Features by Mutual Information')
+   plt.savefig('../outputs/figures/feature_importance_mi.png')
+   
+   # Cell 5: t-SNE visualization
+   from sklearn.manifold import TSNE
+   
+   tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(df)-1))
+   X_tsne = tsne.fit_transform(X)
+   
+   plt.figure(figsize=(10, 8))
+   for label, color in [('BBH', 'blue'), ('NS-present', 'red')]:
+       mask = df['label'] == label
+       plt.scatter(X_tsne[mask, 0], X_tsne[mask, 1], c=color, label=label, alpha=0.7)
+   plt.legend()
+   plt.title('t-SNE Feature Space')
+   plt.savefig('../outputs/figures/feature_tsne.png')
+   
+   # Cell 6: Top discriminative features
+   print("\nTop 10 Most Discriminative Features:")
+   print(mi_df.head(10).to_string(index=False))
+   ```
+
+2. Key visualizations:
+   - Violin plots: feature distributions by class
+   - Correlation heatmap: identify redundant features
+   - t-SNE: 2D visualization of feature space
+   - Bar chart: feature importance ranking
+
+**Acceptance Criteria:**
+- [ ] Clear class separation visible in key features
+- [ ] Correlation analysis identifies redundant features
+- [ ] t-SNE shows some clustering by class
+- [ ] Top 10 features identified for baseline model
+
+**Files Created:**
+- `notebooks/05_feature_extraction.ipynb`
+- `outputs/figures/feature_distributions.png`
+- `outputs/figures/feature_correlations.png`
+- `outputs/figures/feature_importance_mi.png`
+- `outputs/figures/feature_tsne.png`
 
 ---
 
@@ -857,14 +1500,615 @@ GW170817,1187008882.4,O2,H1L1V1,BNS,NS-present,1.46,1.27,1.186,<1e-7
 **Milestone:** M2  
 **Goal:** Train interpretable ML model on real events
 
-| Issue | Title | Description |
-|-------|-------|-------------|
-| E4-1 | Train/val split | Stratified split preserving class balance |
-| E4-2 | Random Forest baseline | Train RF with class weights, 5-fold CV |
-| E4-3 | XGBoost comparison | Train XGBoost, compare to RF |
-| E4-4 | Feature importance | SHAP values, permutation importance |
-| E4-5 | Baseline evaluation | Accuracy, F1, AUC, confusion matrix |
-| E4-6 | Phase 1 report | Document baseline results, identify best features |
+---
+
+### E4-1: Train/Validation Split
+**Priority:** 🔴 Critical | **Estimate:** 1-2 hours
+
+**Objective:** Create stratified train/val split preserving class balance
+
+**Implementation Steps:**
+1. Create split logic:
+   ```python
+   from sklearn.model_selection import StratifiedKFold, train_test_split
+   import json
+   
+   def create_splits(df, test_size=0.2, n_folds=5, seed=42):
+       """
+       Create train/val splits with stratification
+       
+       Strategy:
+       - O1-O3 for training/validation (cross-validation)
+       - O4a held out for final testing (not used in Phase 1)
+       """
+       
+       # Filter to training runs only
+       train_df = df[df['run'].isin(['O1', 'O2', 'O3a', 'O3b'])]
+       test_df = df[df['run'] == 'O4a']  # Held out
+       
+       X = train_df['event_name'].values
+       y = train_df['label'].values
+       
+       # Create k-fold splits for cross-validation
+       skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+       
+       splits = {
+           'train_events': train_df['event_name'].tolist(),
+           'test_events': test_df['event_name'].tolist(),
+           'folds': []
+       }
+       
+       for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+           splits['folds'].append({
+               'fold': fold,
+               'train': X[train_idx].tolist(),
+               'val': X[val_idx].tolist()
+           })
+       
+       # Also create a single 80/20 split
+       train_events, val_events = train_test_split(
+           X, test_size=test_size, stratify=y, random_state=seed
+       )
+       splits['simple_split'] = {
+           'train': train_events.tolist(),
+           'val': val_events.tolist()
+       }
+       
+       return splits
+   
+   # Save splits
+   splits = create_splits(df)
+   with open('manifests/splits.json', 'w') as f:
+       json.dump(splits, f, indent=2)
+   ```
+
+2. Verify class balance:
+   ```python
+   for fold in splits['folds']:
+       train_labels = df[df['event_name'].isin(fold['train'])]['label']
+       val_labels = df[df['event_name'].isin(fold['val'])]['label']
+       print(f"Fold {fold['fold']}: Train BBH={sum(train_labels=='BBH')}, "
+             f"NS={sum(train_labels=='NS-present')} | "
+             f"Val BBH={sum(val_labels=='BBH')}, NS={sum(val_labels=='NS-present')}")
+   ```
+
+**Expected Split:**
+```
+Total events: ~90 (O1-O3)
+- BBH: ~85
+- NS-present: ~5
+
+Each fold:
+- Train: ~72 events
+- Val: ~18 events
+```
+
+**Acceptance Criteria:**
+- [ ] Stratified splits maintain class ratio
+- [ ] 5-fold CV setup ready
+- [ ] O4a events excluded from training
+- [ ] splits.json saved
+
+**Files Created:**
+- `manifests/splits.json`
+
+---
+
+### E4-2: Random Forest Baseline
+**Priority:** 🔴 Critical | **Estimate:** 3-4 hours
+
+**Objective:** Train Random Forest classifier with cross-validation
+
+**Implementation Steps:**
+1. Update `src/models/baseline.py`:
+   ```python
+   from sklearn.ensemble import RandomForestClassifier
+   from sklearn.model_selection import cross_val_predict, cross_validate
+   from sklearn.preprocessing import StandardScaler
+   from sklearn.pipeline import Pipeline
+   import numpy as np
+   import joblib
+   
+   class BaselineClassifier:
+       def __init__(self, model_type='rf', config=None):
+           self.model_type = model_type
+           self.config = config or {}
+           self.pipeline = None
+           
+       def build_pipeline(self):
+           """Build sklearn pipeline with scaling + classifier"""
+           
+           if self.model_type == 'rf':
+               classifier = RandomForestClassifier(
+                   n_estimators=self.config.get('n_estimators', 200),
+                   max_depth=self.config.get('max_depth', 10),
+                   min_samples_split=self.config.get('min_samples_split', 5),
+                   min_samples_leaf=self.config.get('min_samples_leaf', 2),
+                   class_weight='balanced',  # Handle imbalance
+                   random_state=42,
+                   n_jobs=-1
+               )
+           else:
+               raise ValueError(f"Unknown model type: {self.model_type}")
+           
+           self.pipeline = Pipeline([
+               ('scaler', StandardScaler()),
+               ('classifier', classifier)
+           ])
+           
+           return self.pipeline
+       
+       def cross_validate(self, X, y, cv=5):
+           """Perform cross-validation with multiple metrics"""
+           
+           if self.pipeline is None:
+               self.build_pipeline()
+           
+           scoring = {
+               'accuracy': 'accuracy',
+               'f1': 'f1',
+               'precision': 'precision',
+               'recall': 'recall',
+               'roc_auc': 'roc_auc'
+           }
+           
+           results = cross_validate(
+               self.pipeline, X, y,
+               cv=cv,
+               scoring=scoring,
+               return_train_score=True
+           )
+           
+           return results
+       
+       def get_cv_predictions(self, X, y, cv=5):
+           """Get cross-validated predictions for all samples"""
+           
+           if self.pipeline is None:
+               self.build_pipeline()
+           
+           y_pred = cross_val_predict(self.pipeline, X, y, cv=cv)
+           y_proba = cross_val_predict(self.pipeline, X, y, cv=cv, method='predict_proba')
+           
+           return y_pred, y_proba
+       
+       def fit(self, X, y):
+           """Fit on full training data"""
+           if self.pipeline is None:
+               self.build_pipeline()
+           self.pipeline.fit(X, y)
+           return self
+       
+       def predict(self, X):
+           """Predict class labels"""
+           return self.pipeline.predict(X)
+       
+       def predict_proba(self, X):
+           """Predict class probabilities"""
+           return self.pipeline.predict_proba(X)
+       
+       def save(self, path):
+           """Save trained model"""
+           joblib.dump(self.pipeline, path)
+       
+       def load(self, path):
+           """Load trained model"""
+           self.pipeline = joblib.load(path)
+           return self
+   ```
+
+2. Create training notebook `notebooks/06_phase1_baseline.ipynb`:
+   ```python
+   # Cell 1: Load data
+   import pandas as pd
+   import numpy as np
+   from src.models.baseline import BaselineClassifier
+   
+   df = pd.read_csv('../data/features/features.csv')
+   feature_cols = [c for c in df.columns if c not in ['event_name', 'label', 'run']]
+   
+   # Filter to training data (O1-O3)
+   train_df = df[df['run'].isin(['O1', 'O2', 'O3a', 'O3b'])]
+   
+   X = train_df[feature_cols].values
+   y = (train_df['label'] == 'NS-present').astype(int).values
+   
+   # Cell 2: Cross-validation
+   rf_model = BaselineClassifier(model_type='rf', config={
+       'n_estimators': 200,
+       'max_depth': 10
+   })
+   
+   cv_results = rf_model.cross_validate(X, y, cv=5)
+   
+   print("Cross-Validation Results:")
+   for metric in ['accuracy', 'f1', 'precision', 'recall', 'roc_auc']:
+       scores = cv_results[f'test_{metric}']
+       print(f"  {metric}: {scores.mean():.3f} ± {scores.std():.3f}")
+   
+   # Cell 3: Get predictions for confusion matrix
+   y_pred, y_proba = rf_model.get_cv_predictions(X, y, cv=5)
+   
+   from sklearn.metrics import confusion_matrix, classification_report
+   print("\nClassification Report:")
+   print(classification_report(y, y_pred, target_names=['BBH', 'NS-present']))
+   
+   # Cell 4: Plot confusion matrix
+   cm = confusion_matrix(y, y_pred)
+   plt.figure(figsize=(8, 6))
+   sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+               xticklabels=['BBH', 'NS-present'],
+               yticklabels=['BBH', 'NS-present'])
+   plt.xlabel('Predicted')
+   plt.ylabel('Actual')
+   plt.title('Random Forest - Confusion Matrix (5-Fold CV)')
+   plt.savefig('../outputs/figures/rf_confusion_matrix.png')
+   
+   # Cell 5: Train final model on all training data
+   rf_model.fit(X, y)
+   rf_model.save('../outputs/models/phase1/rf_baseline.joblib')
+   ```
+
+**Acceptance Criteria:**
+- [ ] 5-fold CV completed
+- [ ] All metrics reported with std dev
+- [ ] Confusion matrix shows NS-present recall ≥ 50% (given imbalance)
+- [ ] Model saved to outputs/models/phase1/
+
+**Files Modified:**
+- `src/models/baseline.py`
+
+**Files Created:**
+- `notebooks/06_phase1_baseline.ipynb`
+- `outputs/models/phase1/rf_baseline.joblib`
+- `outputs/figures/rf_confusion_matrix.png`
+
+---
+
+### E4-3: XGBoost Comparison
+**Priority:** 🟠 High | **Estimate:** 2-3 hours
+
+**Objective:** Train XGBoost and compare to Random Forest
+
+**Implementation Steps:**
+1. Add XGBoost to `src/models/baseline.py`:
+   ```python
+   from xgboost import XGBClassifier
+   
+   class BaselineClassifier:
+       def build_pipeline(self):
+           if self.model_type == 'rf':
+               # ... existing RF code ...
+               
+           elif self.model_type == 'xgboost':
+               # Calculate scale_pos_weight for imbalance
+               classifier = XGBClassifier(
+                   n_estimators=self.config.get('n_estimators', 200),
+                   max_depth=self.config.get('max_depth', 6),
+                   learning_rate=self.config.get('learning_rate', 0.1),
+                   subsample=self.config.get('subsample', 0.8),
+                   colsample_bytree=self.config.get('colsample_bytree', 0.8),
+                   scale_pos_weight=self.config.get('scale_pos_weight', 15),  # ~85/5
+                   random_state=42,
+                   use_label_encoder=False,
+                   eval_metric='logloss'
+               )
+   ```
+
+2. Compare models in notebook:
+   ```python
+   # Train XGBoost
+   xgb_model = BaselineClassifier(model_type='xgboost', config={
+       'n_estimators': 200,
+       'max_depth': 6,
+       'scale_pos_weight': 15
+   })
+   
+   xgb_results = xgb_model.cross_validate(X, y, cv=5)
+   
+   # Comparison table
+   comparison = pd.DataFrame({
+       'Metric': ['Accuracy', 'F1', 'Precision', 'Recall', 'ROC-AUC'],
+       'RF': [cv_results[f'test_{m}'].mean() for m in ['accuracy', 'f1', 'precision', 'recall', 'roc_auc']],
+       'XGBoost': [xgb_results[f'test_{m}'].mean() for m in ['accuracy', 'f1', 'precision', 'recall', 'roc_auc']]
+   })
+   print(comparison.to_string(index=False))
+   ```
+
+3. ROC curve comparison:
+   ```python
+   from sklearn.metrics import roc_curve, auc
+   
+   # Get probabilities from both models
+   _, rf_proba = rf_model.get_cv_predictions(X, y, cv=5)
+   _, xgb_proba = xgb_model.get_cv_predictions(X, y, cv=5)
+   
+   plt.figure(figsize=(8, 6))
+   for name, proba in [('RF', rf_proba), ('XGBoost', xgb_proba)]:
+       fpr, tpr, _ = roc_curve(y, proba[:, 1])
+       roc_auc = auc(fpr, tpr)
+       plt.plot(fpr, tpr, label=f'{name} (AUC={roc_auc:.3f})')
+   
+   plt.plot([0, 1], [0, 1], 'k--')
+   plt.xlabel('False Positive Rate')
+   plt.ylabel('True Positive Rate')
+   plt.title('ROC Curve Comparison')
+   plt.legend()
+   plt.savefig('../outputs/figures/roc_comparison.png')
+   ```
+
+**Acceptance Criteria:**
+- [ ] XGBoost trained with same CV setup
+- [ ] Comparison table generated
+- [ ] ROC curves plotted
+- [ ] Best model identified
+
+**Files Modified:**
+- `src/models/baseline.py`
+- `notebooks/06_phase1_baseline.ipynb`
+
+**Files Created:**
+- `outputs/models/phase1/xgb_baseline.joblib`
+- `outputs/figures/roc_comparison.png`
+
+---
+
+### E4-4: Feature Importance Analysis
+**Priority:** 🟠 High | **Estimate:** 2-3 hours
+
+**Objective:** Identify most important features using SHAP and permutation importance
+
+**Implementation Steps:**
+1. Add SHAP analysis:
+   ```python
+   import shap
+   
+   # Train model on full data
+   rf_model.fit(X, y)
+   
+   # SHAP values
+   explainer = shap.TreeExplainer(rf_model.pipeline.named_steps['classifier'])
+   X_scaled = rf_model.pipeline.named_steps['scaler'].transform(X)
+   shap_values = explainer.shap_values(X_scaled)
+   
+   # Summary plot
+   plt.figure(figsize=(10, 8))
+   shap.summary_plot(shap_values[1], X_scaled, feature_names=feature_cols, show=False)
+   plt.tight_layout()
+   plt.savefig('../outputs/figures/shap_summary.png')
+   
+   # Bar plot (mean absolute SHAP)
+   plt.figure(figsize=(10, 8))
+   shap.summary_plot(shap_values[1], X_scaled, feature_names=feature_cols, 
+                     plot_type='bar', show=False)
+   plt.tight_layout()
+   plt.savefig('../outputs/figures/shap_importance.png')
+   ```
+
+2. Permutation importance:
+   ```python
+   from sklearn.inspection import permutation_importance
+   
+   perm_importance = permutation_importance(
+       rf_model.pipeline, X, y, 
+       n_repeats=30, 
+       random_state=42,
+       scoring='f1'
+   )
+   
+   perm_df = pd.DataFrame({
+       'feature': feature_cols,
+       'importance': perm_importance.importances_mean,
+       'std': perm_importance.importances_std
+   }).sort_values('importance', ascending=False)
+   
+   print("Top 10 Features (Permutation Importance):")
+   print(perm_df.head(10).to_string(index=False))
+   ```
+
+3. Compare importance methods:
+   ```python
+   # Random Forest built-in importance
+   rf_importance = rf_model.pipeline.named_steps['classifier'].feature_importances_
+   
+   # Create comparison DataFrame
+   importance_df = pd.DataFrame({
+       'feature': feature_cols,
+       'RF_builtin': rf_importance,
+       'Permutation': perm_importance.importances_mean,
+       'SHAP': np.abs(shap_values[1]).mean(axis=0)
+   })
+   
+   # Rank correlation between methods
+   from scipy.stats import spearmanr
+   print(f"Spearman correlation (RF vs SHAP): {spearmanr(importance_df['RF_builtin'], importance_df['SHAP'])[0]:.3f}")
+   ```
+
+**Acceptance Criteria:**
+- [ ] SHAP summary plot generated
+- [ ] Top 10 features identified by each method
+- [ ] Feature importance consistent across methods
+- [ ] Interpretable features (ridge_slope, etc.) rank high
+
+**Files Created:**
+- `outputs/figures/shap_summary.png`
+- `outputs/figures/shap_importance.png`
+- `outputs/figures/permutation_importance.png`
+
+---
+
+### E4-5: Baseline Evaluation
+**Priority:** 🔴 Critical | **Estimate:** 2-3 hours
+
+**Objective:** Comprehensive evaluation of baseline models
+
+**Implementation Steps:**
+1. Create evaluation module `src/evaluation/metrics.py`:
+   ```python
+   from sklearn.metrics import (
+       accuracy_score, f1_score, precision_score, recall_score,
+       roc_auc_score, confusion_matrix, classification_report,
+       precision_recall_curve, roc_curve
+   )
+   import numpy as np
+   
+   def evaluate_classifier(y_true, y_pred, y_proba=None):
+       """Compute comprehensive classification metrics"""
+       
+       metrics = {
+           'accuracy': accuracy_score(y_true, y_pred),
+           'f1': f1_score(y_true, y_pred),
+           'precision': precision_score(y_true, y_pred),
+           'recall': recall_score(y_true, y_pred),  # NS-present recall!
+           'specificity': recall_score(y_true, y_pred, pos_label=0),
+       }
+       
+       if y_proba is not None:
+           metrics['roc_auc'] = roc_auc_score(y_true, y_proba)
+       
+       metrics['confusion_matrix'] = confusion_matrix(y_true, y_pred)
+       
+       return metrics
+   
+   def print_evaluation_report(metrics, model_name='Model'):
+       """Print formatted evaluation report"""
+       print(f"\n{'='*50}")
+       print(f"{model_name} Evaluation Report")
+       print(f"{'='*50}")
+       print(f"Accuracy:    {metrics['accuracy']:.3f}")
+       print(f"F1 Score:    {metrics['f1']:.3f}")
+       print(f"Precision:   {metrics['precision']:.3f}")
+       print(f"Recall:      {metrics['recall']:.3f}  ← NS-present recall (target: >85%)")
+       print(f"Specificity: {metrics['specificity']:.3f}")
+       if 'roc_auc' in metrics:
+           print(f"ROC-AUC:     {metrics['roc_auc']:.3f}")
+       print(f"\nConfusion Matrix:")
+       print(metrics['confusion_matrix'])
+   ```
+
+2. Evaluate all models:
+   ```python
+   # Evaluate RF
+   y_pred_rf, y_proba_rf = rf_model.get_cv_predictions(X, y, cv=5)
+   rf_metrics = evaluate_classifier(y, y_pred_rf, y_proba_rf[:, 1])
+   print_evaluation_report(rf_metrics, 'Random Forest')
+   
+   # Evaluate XGBoost
+   y_pred_xgb, y_proba_xgb = xgb_model.get_cv_predictions(X, y, cv=5)
+   xgb_metrics = evaluate_classifier(y, y_pred_xgb, y_proba_xgb[:, 1])
+   print_evaluation_report(xgb_metrics, 'XGBoost')
+   ```
+
+3. Create evaluation summary table:
+   ```python
+   summary = pd.DataFrame({
+       'Model': ['Random Forest', 'XGBoost'],
+       'Accuracy': [rf_metrics['accuracy'], xgb_metrics['accuracy']],
+       'F1': [rf_metrics['f1'], xgb_metrics['f1']],
+       'Precision': [rf_metrics['precision'], xgb_metrics['precision']],
+       'Recall (NS)': [rf_metrics['recall'], xgb_metrics['recall']],
+       'ROC-AUC': [rf_metrics['roc_auc'], xgb_metrics['roc_auc']]
+   })
+   summary.to_csv('../outputs/results/phase1_results.csv', index=False)
+   print(summary.to_markdown(index=False))
+   ```
+
+**Acceptance Criteria:**
+- [ ] All metrics computed for both models
+- [ ] NS-present recall explicitly reported
+- [ ] Results saved to CSV
+- [ ] Best model selected based on recall
+
+**Files Created:**
+- `src/evaluation/metrics.py`
+- `outputs/results/phase1_results.csv`
+
+---
+
+### E4-6: Phase 1 Report
+**Priority:** 🟠 High | **Estimate:** 2-3 hours
+
+**Objective:** Document Phase 1 results and findings
+
+**Implementation Steps:**
+1. Create summary in notebook:
+   ```python
+   # Final notebook cell: Phase 1 Summary
+   
+   print("""
+   # Phase 1 Results Summary
+   
+   ## Dataset
+   - Total events: {n_events}
+   - BBH: {n_bbh}
+   - NS-present: {n_ns}
+   - Features: {n_features}
+   
+   ## Best Model: {best_model}
+   - Accuracy: {acc:.1%}
+   - F1 Score: {f1:.3f}
+   - NS-present Recall: {recall:.1%}
+   - ROC-AUC: {auc:.3f}
+   
+   ## Top 5 Features:
+   1. {f1}
+   2. {f2}
+   3. {f3}
+   4. {f4}
+   5. {f5}
+   
+   ## Key Findings:
+   - Ridge slope is most discriminative feature
+   - Frequency-based features (spectral_centroid, band_power_ratio) highly predictive
+   - Class imbalance limits NS-present precision
+   - Model generalizes across O1-O3 runs
+   
+   ## Limitations:
+   - Small NS-present sample size (n=5-6)
+   - High variance in CV metrics due to small dataset
+   - Unable to validate on O4a (held out for Phase 2)
+   
+   ## Recommendations for Phase 2:
+   - Synthetic data needed to improve NS-present classification
+   - CNN may capture features not hand-engineered
+   - Physics-informed loss could improve precision
+   """.format(...))
+   ```
+
+2. Generate all Phase 1 figures:
+   - Feature distributions (from E3-6)
+   - Confusion matrices (RF and XGBoost)
+   - ROC curves
+   - SHAP importance plots
+   - Example spectrograms (BBH vs BNS)
+
+3. Save final metrics:
+   ```python
+   phase1_summary = {
+       'best_model': 'Random Forest',
+       'accuracy': rf_metrics['accuracy'],
+       'f1': rf_metrics['f1'],
+       'recall_ns': rf_metrics['recall'],
+       'roc_auc': rf_metrics['roc_auc'],
+       'top_features': perm_df['feature'].head(10).tolist(),
+       'n_events': len(train_df),
+       'n_features': len(feature_cols)
+   }
+   
+   with open('../outputs/results/phase1_summary.json', 'w') as f:
+       json.dump(phase1_summary, f, indent=2)
+   ```
+
+**Acceptance Criteria:**
+- [ ] Summary document written
+- [ ] All figures generated
+- [ ] Key findings documented
+- [ ] Limitations acknowledged
+- [ ] Phase 2 recommendations provided
+
+**Files Created:**
+- `outputs/results/phase1_summary.json`
+- `outputs/figures/phase1_summary.png` (combined figure)
 
 ---
 
