@@ -1,0 +1,231 @@
+# Main Configuration File
+# GW Event Classification Project
+
+# =============================================================================
+# PATHS
+# =============================================================================
+paths:
+  data_root: "data"
+  raw_data: "data/raw"
+  noise_data: "data/noise"
+  synthetic_data: "data/synthetic"
+  spectrograms: "data/spectrograms"
+  features: "data/features"
+  manifests: "manifests"
+  outputs: "outputs"
+  models: "outputs/models"
+  figures: "outputs/figures"
+  results: "outputs/results"
+  logs: "outputs/logs"
+
+# =============================================================================
+# DATA ACQUISITION
+# =============================================================================
+data:
+  # Observing runs
+  training_runs: ["O1", "O2", "O3a", "O3b"]
+  test_runs: ["O4a"]
+  
+  # Detectors
+  primary_detector: "L1"
+  secondary_detector: "H1"
+  use_multi_detector: false  # Enable for detector fusion
+  
+  # Strain settings
+  sample_rate: 4096  # Hz (4096 or 16384)
+  window_duration: 32  # seconds before/after merger
+  
+  # Event filtering
+  confident_only: true
+  min_snr: 8.0
+
+# =============================================================================
+# PREPROCESSING
+# =============================================================================
+preprocessing:
+  # Bandpass filter
+  bandpass:
+    low_freq: 20  # Hz
+    high_freq: 512  # Hz
+    order: 8
+  
+  # Whitening
+  whitening:
+    enabled: true
+    segment_duration: 4  # seconds
+    
+  # Notch filter (power line)
+  notch:
+    enabled: true
+    frequencies: [60, 120, 180]  # Hz (60 Hz harmonics)
+    quality_factor: 30
+
+# =============================================================================
+# SPECTROGRAM
+# =============================================================================
+spectrogram:
+  # FFT parameters
+  fft_length: 1.0  # seconds
+  overlap: 0.5  # fraction (0-1)
+  window: "hann"
+  
+  # Frequency range
+  freq_min: 20  # Hz
+  freq_max: 500  # Hz
+  
+  # Output image size (for CNN)
+  image_size: 224  # pixels (224x224 for ResNet)
+  
+  # Normalization
+  normalization: "per_event"  # "per_event", "global", "none"
+  log_scale: true
+
+# =============================================================================
+# SYNTHETIC DATA (Phase 2)
+# =============================================================================
+synthetic:
+  # Total samples per class
+  n_bbh: 5000
+  n_ns_present: 5000  # BNS + NSBH combined
+  
+  # SNR distribution
+  snr_min: 8
+  snr_max: 30
+  snr_distribution: "uniform"  # "uniform" or "log_uniform"
+  
+  # Injection settings
+  noise_source: "real"  # Use real LIGO noise
+  random_seed: 42
+
+# =============================================================================
+# FEATURES (Phase 1)
+# =============================================================================
+features:
+  # Chirp ridge features
+  ridge:
+    enabled: true
+    threshold_percentile: 90
+    
+  # Band power features
+  band_power:
+    enabled: true
+    bands: [[20, 50], [50, 100], [100, 200], [200, 500]]
+    
+  # Spectral features
+  spectral:
+    enabled: true
+    include_centroid: true
+    include_bandwidth: true
+    include_entropy: true
+
+# =============================================================================
+# MODEL - PHASE 1 (Baseline)
+# =============================================================================
+phase1:
+  model: "random_forest"  # "random_forest", "xgboost", "svm"
+  
+  random_forest:
+    n_estimators: 100
+    max_depth: 10
+    class_weight: "balanced"
+    random_state: 42
+    
+  xgboost:
+    n_estimators: 100
+    max_depth: 6
+    learning_rate: 0.1
+    scale_pos_weight: "auto"  # Handle imbalance
+    
+  cross_validation:
+    n_splits: 5
+    stratified: true
+
+# =============================================================================
+# MODEL - PHASE 2 (Deep Learning)
+# =============================================================================
+phase2:
+  # Architecture
+  backbone: "resnet50"  # "resnet18", "resnet50", "resnet101", "efficientnet_b0"
+  pretrained: true
+  num_classes: 2
+  
+  # Training
+  training:
+    batch_size: 128  # A100 can handle 128-256
+    epochs: 50
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    scheduler: "cosine"  # "cosine", "step", "plateau"
+    
+  # Mixed precision (A100 optimization)
+  amp:
+    enabled: true
+    dtype: "bfloat16"  # A100 supports bfloat16 natively
+    
+  # Data loading (A100 optimization)
+  dataloader:
+    num_workers: 8
+    pin_memory: true
+    prefetch_factor: 2
+    
+  # Augmentation
+  augmentation:
+    time_jitter: 0.5  # seconds
+    noise_injection: true
+    noise_snr_range: [0.8, 1.2]  # Multiply SNR by this factor
+    frequency_mask: true
+    frequency_mask_width: 20  # Hz
+    
+  # Early stopping
+  early_stopping:
+    patience: 10
+    min_delta: 0.001
+    monitor: "val_auc"
+
+# =============================================================================
+# PHYSICS-INFORMED LOSS
+# =============================================================================
+physics_loss:
+  enabled: true
+  weight: 0.1  # Weight of physics loss vs classification loss
+  
+  # Chirp mass constraint: f ∝ M_c^(-5/8)
+  chirp_mass:
+    k_constant: 1.0  # Calibration constant (to be tuned)
+    
+# =============================================================================
+# EVALUATION
+# =============================================================================
+evaluation:
+  metrics:
+    - "accuracy"
+    - "precision"
+    - "recall"
+    - "f1"
+    - "auc_roc"
+    - "confusion_matrix"
+    
+  # Target thresholds
+  targets:
+    accuracy: 0.90
+    false_positive_rate: 0.10
+    ns_recall: 0.85
+    inference_latency_ms: 1000
+
+# =============================================================================
+# REPRODUCIBILITY
+# =============================================================================
+reproducibility:
+  random_seed: 42
+  deterministic: true
+  
+# =============================================================================
+# LOGGING
+# =============================================================================
+logging:
+  level: "INFO"
+  tensorboard: true
+  wandb:
+    enabled: false
+    project: "gw-classification"
+    entity: null

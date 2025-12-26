@@ -1,0 +1,174 @@
+# PyCBC Injection Parameters
+# Waveform generation settings for synthetic data
+
+# =============================================================================
+# BBH (Binary Black Hole) Parameters
+# =============================================================================
+bbh:
+  # Mass parameters (solar masses)
+  mass1:
+    min: 5.0
+    max: 100.0
+    distribution: "power_law"  # Matches astrophysical prior
+    power_law_index: -2.3
+    
+  mass2:
+    min: 5.0
+    max: 100.0
+    distribution: "power_law"
+    power_law_index: -2.3
+    
+  # Mass ratio constraint
+  mass_ratio:
+    min: 0.1  # m2/m1
+    max: 1.0
+    
+  # Spin parameters (dimensionless)
+  spin1z:
+    min: -0.99
+    max: 0.99
+    distribution: "uniform"
+    
+  spin2z:
+    min: -0.99
+    max: 0.99
+    distribution: "uniform"
+    
+  # Waveform approximant
+  approximant: "IMRPhenomD"
+  
+  # Frequency settings
+  f_lower: 20.0  # Hz
+  
+# =============================================================================
+# BNS (Binary Neutron Star) Parameters
+# =============================================================================
+bns:
+  # Mass parameters (solar masses)
+  mass1:
+    min: 1.0
+    max: 2.5
+    distribution: "gaussian"
+    mean: 1.35
+    std: 0.15
+    
+  mass2:
+    min: 1.0
+    max: 2.5
+    distribution: "gaussian"
+    mean: 1.35
+    std: 0.15
+    
+  # Spin parameters (NS spins are small)
+  spin1z:
+    min: -0.05
+    max: 0.05
+    distribution: "uniform"
+    
+  spin2z:
+    min: -0.05
+    max: 0.05
+    distribution: "uniform"
+    
+  # Waveform approximant
+  approximant: "TaylorF2"
+  
+  # Frequency settings
+  f_lower: 20.0  # Hz
+  
+# =============================================================================
+# NSBH (Neutron Star - Black Hole) Parameters
+# =============================================================================
+nsbh:
+  # Black hole mass (solar masses)
+  mass1:
+    min: 5.0
+    max: 50.0
+    distribution: "power_law"
+    power_law_index: -2.3
+    
+  # Neutron star mass (solar masses)
+  mass2:
+    min: 1.0
+    max: 2.5
+    distribution: "gaussian"
+    mean: 1.35
+    std: 0.15
+    
+  # BH spin
+  spin1z:
+    min: -0.99
+    max: 0.99
+    distribution: "uniform"
+    
+  # NS spin (small)
+  spin2z:
+    min: -0.05
+    max: 0.05
+    distribution: "uniform"
+    
+  # Waveform approximant
+  approximant: "IMRPhenomNSBH"
+  
+  # Frequency settings
+  f_lower: 20.0  # Hz
+
+# =============================================================================
+# Common Injection Parameters
+# =============================================================================
+injection:
+  # Distance (Mpc) - affects SNR
+  distance:
+    min: 10.0
+    max: 1000.0
+    distribution: "uniform_in_volume"  # p(d) ∝ d^2
+    
+  # Sky location (for single detector, less relevant)
+  ra:
+    min: 0.0
+    max: 6.283185  # 2π
+    distribution: "uniform"
+    
+  dec:
+    min: -1.5708  # -π/2
+    max: 1.5708   # π/2
+    distribution: "cos"  # Uniform on sphere
+    
+  # Inclination
+  inclination:
+    min: 0.0
+    max: 3.14159  # π
+    distribution: "sin"  # Uniform on sphere
+    
+  # Polarization
+  polarization:
+    min: 0.0
+    max: 3.14159  # π
+    distribution: "uniform"
+    
+  # Coalescence phase
+  coa_phase:
+    min: 0.0
+    max: 6.283185  # 2π
+    distribution: "uniform"
+
+# =============================================================================
+# SNR Targeting
+# =============================================================================
+snr:
+  # Target SNR range
+  min: 8.0
+  max: 30.0
+  
+  # Distribution
+  distribution: "log_uniform"  # More low-SNR events (realistic)
+  
+  # Rescaling method
+  rescale_method: "distance"  # Adjust distance to achieve target SNR
+
+# =============================================================================
+# NS-Present Class Composition
+# =============================================================================
+ns_present:
+  # Fraction of BNS vs NSBH in "NS-present" class
+  bns_fraction: 0.5  # 50% BNS, 50% NSBH

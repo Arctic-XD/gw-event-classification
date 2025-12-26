@@ -1,0 +1,286 @@
+# Model Hyperparameters
+# Detailed configuration for all models
+
+# =============================================================================
+# PHASE 1: BASELINE MODELS
+# =============================================================================
+
+random_forest:
+  # Core parameters
+  n_estimators: 100
+  criterion: "gini"
+  max_depth: 10
+  min_samples_split: 5
+  min_samples_leaf: 2
+  max_features: "sqrt"
+  
+  # Class imbalance handling
+  class_weight: "balanced"
+  
+  # Reproducibility
+  random_state: 42
+  n_jobs: -1  # Use all cores
+  
+  # Hyperparameter search space (for tuning)
+  search_space:
+    n_estimators: [50, 100, 200, 500]
+    max_depth: [5, 10, 15, 20, null]
+    min_samples_split: [2, 5, 10]
+    min_samples_leaf: [1, 2, 4]
+
+xgboost:
+  # Core parameters
+  n_estimators: 100
+  max_depth: 6
+  learning_rate: 0.1
+  subsample: 0.8
+  colsample_bytree: 0.8
+  
+  # Regularization
+  reg_alpha: 0.0  # L1
+  reg_lambda: 1.0  # L2
+  
+  # Class imbalance
+  scale_pos_weight: "auto"  # Computed from class distribution
+  
+  # Reproducibility
+  random_state: 42
+  n_jobs: -1
+  
+  # Hyperparameter search space
+  search_space:
+    n_estimators: [50, 100, 200]
+    max_depth: [3, 6, 9, 12]
+    learning_rate: [0.01, 0.05, 0.1, 0.2]
+    subsample: [0.6, 0.8, 1.0]
+
+svm:
+  # Core parameters
+  kernel: "rbf"
+  C: 1.0
+  gamma: "scale"
+  
+  # Class imbalance
+  class_weight: "balanced"
+  
+  # Reproducibility
+  random_state: 42
+  
+  # Hyperparameter search space
+  search_space:
+    C: [0.1, 1.0, 10.0, 100.0]
+    gamma: ["scale", "auto", 0.001, 0.01, 0.1]
+    kernel: ["rbf", "poly"]
+
+# =============================================================================
+# PHASE 2: CNN MODELS
+# =============================================================================
+
+resnet18:
+  # Architecture
+  pretrained: true
+  freeze_backbone: false
+  
+  # Classifier head
+  classifier:
+    dropout: 0.5
+    hidden_dim: 512
+    
+  # Input
+  input_channels: 1  # Grayscale spectrogram
+  
+resnet50:
+  # Architecture
+  pretrained: true
+  freeze_backbone: false
+  
+  # Classifier head
+  classifier:
+    dropout: 0.5
+    hidden_dim: 1024
+    
+  # Input
+  input_channels: 1
+
+resnet101:
+  # Architecture
+  pretrained: true
+  freeze_backbone: false
+  
+  # Classifier head
+  classifier:
+    dropout: 0.5
+    hidden_dim: 1024
+    
+  # Input
+  input_channels: 1
+
+efficientnet_b0:
+  # Architecture
+  pretrained: true
+  freeze_backbone: false
+  
+  # Classifier head
+  classifier:
+    dropout: 0.3
+    
+  # Input
+  input_channels: 1
+
+# =============================================================================
+# TRAINING CONFIGURATION (A100 OPTIMIZED)
+# =============================================================================
+
+training:
+  # Batch size (A100 can handle larger batches)
+  batch_size: 128  # Increase to 256 if memory allows
+  gradient_accumulation_steps: 1
+  
+  # Epochs
+  epochs: 50
+  
+  # Optimizer
+  optimizer:
+    name: "adamw"
+    lr: 0.001
+    weight_decay: 0.0001
+    betas: [0.9, 0.999]
+    
+  # Learning rate scheduler
+  scheduler:
+    name: "cosine"  # "cosine", "step", "plateau", "one_cycle"
+    
+    # Cosine annealing
+    cosine:
+      T_max: 50  # Same as epochs
+      eta_min: 0.00001
+      
+    # Step decay
+    step:
+      step_size: 15
+      gamma: 0.1
+      
+    # Reduce on plateau
+    plateau:
+      factor: 0.5
+      patience: 5
+      min_lr: 0.00001
+      
+    # One cycle (fast convergence)
+    one_cycle:
+      max_lr: 0.01
+      pct_start: 0.3
+      
+  # Warmup
+  warmup:
+    enabled: true
+    epochs: 5
+    start_lr: 0.0001
+    
+  # Label smoothing
+  label_smoothing: 0.1
+  
+  # Gradient clipping
+  gradient_clip:
+    enabled: true
+    max_norm: 1.0
+
+# =============================================================================
+# MIXED PRECISION (A100 OPTIMIZATION)
+# =============================================================================
+
+amp:
+  enabled: true
+  dtype: "bfloat16"  # A100 native support, more stable than fp16
+  
+  # GradScaler (only needed for fp16, not bfloat16)
+  grad_scaler:
+    enabled: false  # bfloat16 doesn't need scaling
+    init_scale: 65536.0
+    growth_factor: 2.0
+    backoff_factor: 0.5
+    growth_interval: 2000
+
+# =============================================================================
+# DATA AUGMENTATION
+# =============================================================================
+
+augmentation:
+  # Probability of applying each augmentation
+  prob: 0.5
+  
+  # Time domain
+  time_jitter:
+    enabled: true
+    max_shift: 0.5  # seconds
+    
+  # Noise injection
+  noise:
+    enabled: true
+    snr_factor_range: [0.8, 1.2]  # Multiply original SNR
+    
+  # Frequency masking (SpecAugment style)
+  freq_mask:
+    enabled: true
+    max_width: 20  # Hz
+    num_masks: 2
+    
+  # Time masking
+  time_mask:
+    enabled: true
+    max_width: 0.2  # seconds
+    num_masks: 2
+    
+  # Mixup
+  mixup:
+    enabled: false
+    alpha: 0.2
+    
+  # CutMix
+  cutmix:
+    enabled: false
+    alpha: 1.0
+
+# =============================================================================
+# PHYSICS-INFORMED LOSS
+# =============================================================================
+
+physics_loss:
+  # Main classification loss
+  classification:
+    type: "cross_entropy"
+    weight: 1.0
+    label_smoothing: 0.1
+    
+  # Chirp mass prediction loss
+  chirp_mass:
+    enabled: true
+    weight: 0.1
+    type: "mse"
+    
+  # Physics constraint loss
+  physics_constraint:
+    enabled: true
+    weight: 0.05
+    
+    # f_peak ∝ M_c^(-5/8) constraint
+    k_constant: 1.0  # To be calibrated
+    tolerance: 0.1  # Allow 10% deviation
+
+# =============================================================================
+# EARLY STOPPING & CHECKPOINTING
+# =============================================================================
+
+early_stopping:
+  enabled: true
+  monitor: "val_auc"
+  mode: "max"
+  patience: 10
+  min_delta: 0.001
+  
+checkpointing:
+  enabled: true
+  monitor: "val_auc"
+  mode: "max"
+  save_top_k: 3
+  save_last: true
